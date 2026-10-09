@@ -10,11 +10,8 @@
 
 <p><input type="file" id="file" accept="audio/*" multiple></p>
 
-<p>
-  <label><input type="checkbox" id="fin"> Fade in</label>
-  <label><input type="checkbox" id="fout"> Fade out</label>
-  <label>Fade length: <input type="number" id="fsec" min="0.5" max="30" step="0.5" value="2" style="width:4em"> s</label>
-</p>
+<p><input type="search" id="q" placeholder="Search sounds" style="width:100%;font-size:1.1em"></p>
+<select id="list" size="10" style="width:100%;font-size:1.1em"></select>
 
 <p>
   <button id="play" style="font-size:1.2em;padding:10px 20px">Play</button>
@@ -22,27 +19,41 @@
   <button id="del" style="font-size:1.2em;padding:10px 20px">Delete</button>
 </p>
 
-<p id="now">Nothing selected.</p>
+<p id="now">Nothing playing.</p>
 
-<select id="list" size="12" style="width:100%;font-size:1.1em"></select>
+<p>Volume: <input type="range" id="vol" min="0" max="1" step="0.01" value="1" style="width:70%"></p>
+
+<p>
+  <label><input type="checkbox" id="loop"> Loop</label>
+  <label><input type="checkbox" id="fin"> Fade in</label>
+  <label><input type="checkbox" id="fout"> Fade out</label>
+  <label>Fade length: <input type="number" id="fsec" min="0.5" max="30" step="0.5" value="2" style="width:4em"> s</label>
+</p>
 
 <script>
 var $ = function (id) { return document.getElementById(id); };
-var db, sounds = [], ctx, voice = null, cache = {};
+var db, sounds = [], ctx, master, voice = null, timer, cache = {};
 try {
   var saved = JSON.parse(localStorage.getItem('sb') || '{}');
   $('fin').checked = !!saved.fin;
   $('fout').checked = !!saved.fout;
+  $('loop').checked = !!saved.loop;
   if (saved.sec) $('fsec').value = saved.sec;
+  if (saved.vol) $('vol').value = saved.vol;
 } catch (e) {}
 function saveSettings() {
   try {
     localStorage.setItem('sb', JSON.stringify({
-      fin: $('fin').checked, fout: $('fout').checked, sec: $('fsec').value
+      fin: $('fin').checked, fout: $('fout').checked, loop: $('loop').checked,
+      sec: $('fsec').value, vol: $('vol').value
     }));
   } catch (e) {}
 }
-$('fin').onchange = $('fout').onchange = $('fsec').onchange = saveSettings;
+$('fin').onchange = $('fout').onchange = $('loop').onchange = $('fsec').onchange = saveSettings;
+$('vol').oninput = function () {
+  if (master) master.gain.value = $('vol').value;
+  saveSettings();
+};
 function openDB() {
   return new Promise(function (res, rej) {
     var r = indexedDB.open('soundboard', 1);
@@ -58,13 +69,12 @@ function run(mode, fn) {
     t.onerror = function () { rej(t.error); };
   });
 }
-function sortSounds() {
-  sounds.sort(function (a, b) { return a.name.localeCompare(b.name, undefined, { numeric: true }); });
-}
 function render() {
-  var keep = $('list').value;
+  var keep = $('list').value, q = $('q').value.toLowerCase();
+  sounds.sort(function (a, b) { return a.name.localeCompare(b.name, undefined, { numeric: true }); });
   $('list').innerHTML = '';
   sounds.forEach(function (s) {
+    if (s.name.toLowerCase().indexOf(q) < 0) return;
     var o = document.createElement('option');
     o.value = s.id;
     o.textContent = s.name;
@@ -72,12 +82,12 @@ function render() {
   });
   if (keep) $('list').value = keep;
 }
+$('q').oninput = render;
 openDB().then(function (d) {
   db = d;
   return run('readonly', function (s) { return s.getAll(); });
 }).then(function (all) {
   sounds = all || [];
-  sortSounds();
   render();
 }).catch(function () {
   $('now').textContent = 'Storage not available - sounds will not be kept.';
@@ -91,7 +101,6 @@ $('file').onchange = async function (e) {
     sounds.push(rec);
   }
   e.target.value = '';
-  sortSounds();
   render();
   try { navigator.storage.persist(); } catch (err) {}
 };
@@ -99,21 +108,35 @@ $('del').onclick = async function () {
   var id = Number($('list').value);
   var s = sounds.find(function (x) { return x.id === id; });
   if (!s || !confirm('Delete "' + s.name + '"?')) return;
-  if (voice && voice.id === id) { try { voice.src.stop(); } catch (e) {} voice = null; }
+  if (voice && voice.id === id) { voice.src.stop(); }
   try { await run('readwrite', function (st) { return st.delete(id); }); } catch (e) {}
   delete cache[id];
   sounds = sounds.filter(function (x) { return x.id !== id; });
   render();
-  $('now').textContent = 'Deleted.';
 };
 function audio() {
-  ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+  if (!ctx) {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    master = ctx.createGain();
+    master.gain.value = $('vol').value;
+    master.connect(ctx.destination);
+  }
   if (ctx.state === 'suspended') ctx.resume();
   return ctx;
 }
 async function getBuffer(s) {
   if (!cache[s.id]) cache[s.id] = await audio().decodeAudioData(await s.blob.arrayBuffer());
   return cache[s.id];
+}
+function time(sec) {
+  sec = Math.floor(sec);
+  return Math.floor(sec / 60) + ':' + ('0' + (sec % 60)).slice(-2);
+}
+function tick() {
+  if (!voice) { clearInterval(timer); return; }
+  var pos = Math.max(0, ctx.currentTime - voice.t);
+  if (voice.src.loop) pos = pos % voice.len;
+  $('now').textContent = 'Playing: ' + voice.name + '  ' + time(pos) + ' / ' + time(voice.len);
 }
 function stopVoice(v) {
   var now = ctx.currentTime, sec = Number($('fsec').value) || 0;
@@ -139,12 +162,13 @@ $('play').onclick = async function () {
 
   var src = c.createBufferSource(), g = c.createGain();
   src.buffer = buf;
+  src.loop = $('loop').checked;
   src.connect(g);
-  g.connect(c.destination);
+  g.connect(master);
 
   var sec = Number($('fsec').value) || 0, d = buf.duration, t = c.currentTime + 0.02;
   var fi = $('fin').checked ? Math.min(sec, d / 2) : 0;
-  var fo = $('fout').checked ? Math.min(sec, d / 2) : 0;
+  var fo = ($('fout').checked && !src.loop) ? Math.min(sec, d / 2) : 0;
   g.gain.setValueAtTime(fi ? 0 : 1, t);
   if (fi) g.gain.linearRampToValueAtTime(1, t + fi);
   if (fo) {
@@ -152,16 +176,18 @@ $('play').onclick = async function () {
     g.gain.linearRampToValueAtTime(0, t + d);
   }
 
-  var v = { id: id, src: src, g: g };
+  var v = { id: id, name: s.name, src: src, g: g, t: t, len: d };
   voice = v;
   src.onended = function () {
     if (voice === v) { voice = null; $('now').textContent = 'Finished: ' + s.name; }
   };
   src.start(t);
-  $('now').textContent = 'Playing: ' + s.name;
+  clearInterval(timer);
+  timer = setInterval(tick, 250);
+  tick();
 };
 $('stop').onclick = function () {
-  if (voice) { stopVoice(voice); $('now').textContent = 'Stopping...'; }
+  if (voice) stopVoice(voice);
 };
 </script>
 </body>
