@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Soundboard</title>
+</head>
+<body>
+<h1>Soundboard</h1>
+
+<p><input type="file" id="file" accept="audio/*" multiple></p>
+
+<p>
+  <label><input type="checkbox" id="fin"> Fade in</label>
+  <label><input type="checkbox" id="fout"> Fade out</label>
+  <label>Fade length: <input type="number" id="fsec" min="0.5" max="30" step="0.5" value="2" style="width:4em"> s</label>
+</p>
+
+<p>
+  <button id="play" style="font-size:1.2em;padding:10px 20px">Play</button>
+  <button id="stop" style="font-size:1.2em;padding:10px 20px">Stop</button>
+  <button id="del" style="font-size:1.2em;padding:10px 20px">Delete</button>
+</p>
+
+<p id="now">Nothing selected.</p>
+
+<select id="list" size="12" style="width:100%;font-size:1.1em"></select>
+
+<script>
+var $ = function (id) { return document.getElementById(id); };
+var db, sounds = [], ctx, voice = null, cache = {};
+try {
+  var saved = JSON.parse(localStorage.getItem('sb') || '{}');
+  $('fin').checked = !!saved.fin;
+  $('fout').checked = !!saved.fout;
+  if (saved.sec) $('fsec').value = saved.sec;
+} catch (e) {}
+function saveSettings() {
+  try {
+    localStorage.setItem('sb', JSON.stringify({
+      fin: $('fin').checked, fout: $('fout').checked, sec: $('fsec').value
+    }));
+  } catch (e) {}
+}
+$('fin').onchange = $('fout').onchange = $('fsec').onchange = saveSettings;
+function openDB() {
+  return new Promise(function (res, rej) {
+    var r = indexedDB.open('soundboard', 1);
+    r.onupgradeneeded = function () { r.result.createObjectStore('s', { keyPath: 'id', autoIncrement: true }); };
+    r.onsuccess = function () { res(r.result); };
+    r.onerror = function () { rej(r.error); };
+  });
+}
+function run(mode, fn) {
+  return new Promise(function (res, rej) {
+    var t = db.transaction('s', mode), rq = fn(t.objectStore('s'));
+    t.oncomplete = function () { res(rq && rq.result); };
+    t.onerror = function () { rej(t.error); };
+  });
+}
+function sortSounds() {
+  sounds.sort(function (a, b) { return a.name.localeCompare(b.name, undefined, { numeric: true }); });
+}
+function render() {
+  var keep = $('list').value;
+  $('list').innerHTML = '';
+  sounds.forEach(function (s) {
+    var o = document.createElement('option');
+    o.value = s.id;
+    o.textContent = s.name;
+    $('list').appendChild(o);
+  });
+  if (keep) $('list').value = keep;
+}
+openDB().then(function (d) {
+  db = d;
+  return run('readonly', function (s) { return s.getAll(); });
+}).then(function (all) {
+  sounds = all || [];
+  sortSounds();
+  render();
+}).catch(function () {
+  $('now').textContent = 'Storage not available - sounds will not be kept.';
+});
+$('file').onchange = async function (e) {
+  for (var i = 0; i < e.target.files.length; i++) {
+    var f = e.target.files[i];
+    var rec = { name: f.name, blob: f };
+    try { rec.id = await run('readwrite', function (s) { return s.add(rec); }); }
+    catch (err) { rec.id = Date.now() + i; }
+    sounds.push(rec);
+  }
+  e.target.value = '';
+  sortSounds();
+  render();
+  try { navigator.storage.persist(); } catch (err) {}
+};
+$('del').onclick = async function () {
+  var id = Number($('list').value);
+  var s = sounds.find(function (x) { return x.id === id; });
+  if (!s || !confirm('Delete "' + s.name + '"?')) return;
+  if (voice && voice.id === id) { try { voice.src.stop(); } catch (e) {} voice = null; }
+  try { await run('readwrite', function (st) { return st.delete(id); }); } catch (e) {}
+  delete cache[id];
+  sounds = sounds.filter(function (x) { return x.id !== id; });
+  render();
+  $('now').textContent = 'Deleted.';
+};
+function audio() {
+  ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state === 'suspended') ctx.resume();
+  return ctx;
+}
+async function getBuffer(s) {
+  if (!cache[s.id]) cache[s.id] = await audio().decodeAudioData(await s.blob.arrayBuffer());
+  return cache[s.id];
+}
+function stopVoice(v) {
+  var now = ctx.currentTime, sec = Number($('fsec').value) || 0;
+  try {
+    if ($('fout').checked && sec > 0) {
+      v.g.gain.cancelScheduledValues(now);
+      v.g.gain.setValueAtTime(v.g.gain.value, now);
+      v.g.gain.linearRampToValueAtTime(0, now + sec);
+      v.src.stop(now + sec + 0.05);
+    } else {
+      v.src.stop();
+    }
+  } catch (e) {}
+}
+$('play').onclick = async function () {
+  var id = Number($('list').value);
+  var s = sounds.find(function (x) { return x.id === id; });
+  if (!s) { $('now').textContent = 'Select a sound first.'; return; }
+  var c = audio(), buf;
+  try { buf = await getBuffer(s); }
+  catch (e) { $('now').textContent = 'Could not read this file.'; return; }
+  if (voice) stopVoice(voice);
+
+  var src = c.createBufferSource(), g = c.createGain();
+  src.buffer = buf;
+  src.connect(g);
+  g.connect(c.destination);
+
+  var sec = Number($('fsec').value) || 0, d = buf.duration, t = c.currentTime + 0.02;
+  var fi = $('fin').checked ? Math.min(sec, d / 2) : 0;
+  var fo = $('fout').checked ? Math.min(sec, d / 2) : 0;
+  g.gain.setValueAtTime(fi ? 0 : 1, t);
+  if (fi) g.gain.linearRampToValueAtTime(1, t + fi);
+  if (fo) {
+    g.gain.setValueAtTime(1, t + d - fo);
+    g.gain.linearRampToValueAtTime(0, t + d);
+  }
+
+  var v = { id: id, src: src, g: g };
+  voice = v;
+  src.onended = function () {
+    if (voice === v) { voice = null; $('now').textContent = 'Finished: ' + s.name; }
+  };
+  src.start(t);
+  $('now').textContent = 'Playing: ' + s.name;
+};
+$('stop').onclick = function () {
+  if (voice) { stopVoice(voice); $('now').textContent = 'Stopping...'; }
+};
+</script>
+</body>
+</html>
